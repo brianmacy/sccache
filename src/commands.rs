@@ -765,6 +765,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 // We aren't asking for a log file
                 daemonize()?;
             }
+            // Drop every inherited fd >= 3 before binding the server socket, so
+            // a lazily-spawned daemon cannot keep the build's pipes (ninja job
+            // pipe, cmake->tee stdout) open and deadlock the ONNX [1165] link.
+            // See util::close_inherited_fds. Must run AFTER redirect_error_log
+            // (the log is dup'd onto fd 2) and BEFORE start_server (which opens
+            // the fds the daemon actually needs).
+            #[cfg(not(windows))]
+            crate::util::close_inherited_fds();
             server::start_server(config, &get_addr())?;
         }
         Command::StartServer => {

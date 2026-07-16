@@ -1183,6 +1183,63 @@ pub fn daemonize() -> Result<()> {
     Ok(())
 }
 
+/// Close every inherited file descriptor `>= 3` (everything but stdio).
+///
+/// Called by the cache server immediately after daemonizing, before it binds
+/// its listening socket. When a compile-job client LAZILY starts the server it
+/// `fork`+`exec`s this process, so the daemon inherits the client's fds —
+/// including ninja's job-completion pipe and the `cmake … | tee` stdout pipe.
+/// Because the server is a persistent daemon, keeping those write-ends open
+/// means ninja's `ppoll` for job-completion EOF never fires at the ONNX
+/// `[1165] Linking libonnxruntime_providers.a` tail → 0%-CPU deadlock until the
+/// runner is reaped. (Root-caused 2026-07-16 via `/proc/<pid>/fd` on the
+/// AL-AMD zig leg; the zig #18887 / sccache #1011 fd-leak class.)
+///
+/// Safe here: `Daemonize` has already pointed stdio at `/dev/null`, any
+/// `SCCACHE_ERROR_LOG` has already been `dup2`'d onto fd 2, and the listening
+/// socket + `SCCACHE_STARTUP_NOTIFY` connection are created AFTER this, so no fd
+/// the daemon needs is open yet. Opt out with `SCCACHE_NO_FD_HYGIENE=1`.
+#[cfg(not(windows))]
+pub fn close_inherited_fds() {
+    use std::env;
+
+    if let Ok(val) = env::var("SCCACHE_NO_FD_HYGIENE") {
+        if val == "1" {
+            return;
+        }
+    }
+
+    // Enumerate the actually-open fds via the fd directory rather than looping
+    // 3..OPEN_MAX, which can be ~1e6 iterations under a high ulimit. Collect
+    // first, then close, so the read_dir handle isn't closed mid-iteration.
+    let fd_dir = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    let mut fds = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fd_dir) {
+        for entry in entries.flatten() {
+            if let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<libc::c_int>().ok())
+            {
+                if fd > 2 {
+                    fds.push(fd);
+                }
+            }
+        }
+    }
+    for fd in fds {
+        // Closing a stale fd (e.g. the now-dropped read_dir handle) just
+        // returns EBADF, which we ignore.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Disable connection pool to avoid broken connection between runtime
 ///
 /// # TODO
