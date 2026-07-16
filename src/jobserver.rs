@@ -88,7 +88,16 @@ impl Client {
 
     pub fn new_num(num: usize) -> Client {
         let inner = jobserver::Client::new(num).expect("failed to create jobserver");
-        Client::_new(inner, false)
+        // SCCACHE_NO_JOBSERVER: fully inert jobserver. We only launch
+        // gcc/clang/zig for local disk caching and ninja -j already governs
+        // parallelism, so we want neither the pipe handoff nor the num_cpus cap.
+        // Reusing the existing `inherited = true` path gives helper/tx = None,
+        // which makes acquire() a no-op (returns _token: None below), and the
+        // guard in configure() skips the pre_exec that clears O_CLOEXEC, so the
+        // pipe fds are never inherited by the child or its grandchildren
+        // (mozilla/sccache#1011).
+        let inert = std::env::var_os("SCCACHE_NO_JOBSERVER").is_some();
+        Client::_new(inner, inert)
     }
 
     fn _new(inner: jobserver::Client, inherited: bool) -> Client {
@@ -117,6 +126,12 @@ impl Client {
 
     /// Configures this jobserver to be inherited by the specified command
     pub fn configure(&self, cmd: &mut Command) {
+        // An inert client (SCCACHE_NO_JOBSERVER, helper/tx = None) must never
+        // hand the pipe fds to the child: configure() is what clears O_CLOEXEC
+        // via pre_exec, and that inheritance is the #1011 fd leak.
+        if self.helper.is_none() {
+            return;
+        }
         self.inner.configure(cmd);
     }
 

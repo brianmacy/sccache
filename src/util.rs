@@ -28,6 +28,8 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{self, SystemTime};
 
@@ -464,62 +466,253 @@ pub fn fmt_duration_as_secs(duration: &Duration) -> String {
 ///
 /// This was lifted from `std::process::Child::wait_with_output` and modified
 /// to also write to stdin.
+/// Default seconds to keep draining captured output *after* the direct child
+/// has exited before declaring a capture stall. Env-tunable via
+/// `SCCACHE_CAPTURE_STALL_SECS`.
+const DEFAULT_CAPTURE_STALL_SECS: u64 = 30;
+
+/// Spawn a background task that reads `reader` to EOF, appending into a shared
+/// buffer. The buffer is readable at any time (even if the task is later
+/// abandoned because a lingering grandchild holds the pipe write-end open), and
+/// `done` flips to `true` on EOF/error. Returns `(buffer, done_flag, task)`.
+fn spawn_capture<R>(
+    reader: Option<R>,
+) -> (
+    Arc<Mutex<Vec<u8>>>,
+    Arc<AtomicBool>,
+    Option<tokio::task::JoinHandle<()>>,
+)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(reader.is_none()));
+    let task = reader.map(|mut r| {
+        let buf = buf.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match r.read(&mut chunk).await {
+                    // EOF (all write-ends closed) or a read error: stop.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        })
+    });
+    (buf, done, task)
+}
+
+/// If `input`, write it to `child`'s stdin while also reading `child`'s stdout and stderr, then wait on `child` and return its status and output.
+///
+/// This was lifted from `std::process::Child::wait_with_output` and modified
+/// to also write to stdin.
+///
+/// Unlike `read_to_end`, capture is bounded by the DIRECT child's exit: once the
+/// child we spawned has exited we drain whatever output is already buffered, but
+/// we do not block forever waiting for EOF. A grandchild (e.g. `zig c++` ->
+/// embedded clang -> `clang -cc1`) can inherit and hold the write-end of our
+/// stdout/stderr pipe open after the direct child exits; `read_to_end` would
+/// then never see EOF and deadlock at 0% CPU (mozilla/sccache#1011 variant #2).
+/// A real compiler flushes all of its output before it exits, so by the time the
+/// direct child has been reaped everything legitimate is already in the pipe and
+/// has been drained by the capture task; only a lingering holder's absent EOF is
+/// skipped. The stall window is `SCCACHE_CAPTURE_STALL_SECS` (default 30s) of no
+/// progress after child exit -- raise it if a toolchain legitimately keeps
+/// writing long after the launcher process returns.
 async fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>) -> Result<process::Output>
 where
     T: CommandChild + 'static,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let stdin = input.and_then(|i| {
         child.take_stdin().map(|mut stdin| async move {
             stdin.write_all(&i).await.context("failed to write stdin")
         })
     });
-    let stdout = child.take_stdout();
-    let stdout = async move {
-        match stdout {
-            Some(mut stdout) => {
-                let mut buf = Vec::new();
-                stdout
-                    .read_to_end(&mut buf)
-                    .await
-                    .context("failed to read stdout")?;
-                Result::Ok(Some(buf))
-            }
-            None => Ok(None),
-        }
-    };
 
-    let stderr = child.take_stderr();
-    let stderr = async move {
-        match stderr {
-            Some(mut stderr) => {
-                let mut buf = Vec::new();
-                stderr
-                    .read_to_end(&mut buf)
-                    .await
-                    .context("failed to read stderr")?;
-                Result::Ok(Some(buf))
-            }
-            None => Ok(None),
-        }
-    };
+    // Snapshot forensic anchors BEFORE the readers are taken / the child is reaped.
+    let child_pid = child.id();
+    let (out_fd, err_fd) = child.capture_fds();
+
+    // Capture stdout/stderr in the background so partial output survives even if
+    // we later have to abandon a stalled read.
+    let (out_buf, out_done, out_task) = spawn_capture(child.take_stdout());
+    let (err_buf, err_done, err_task) = spawn_capture(child.take_stderr());
 
     // Finish writing stdin before waiting, because waiting drops stdin.
-    let status = async move {
-        if let Some(stdin) = stdin {
-            let _ = stdin.await;
-        }
+    if let Some(stdin) = stdin {
+        let _ = stdin.await;
+    }
+    let status = child.wait().await.context("failed to wait for child")?;
 
-        child.wait().await.context("failed to wait for child")
+    // The direct child has exited. Drain buffered output, but bound the wait so a
+    // grandchild holding the pipe write-end open cannot hang us forever.
+    let stall_secs = std::env::var("SCCACHE_CAPTURE_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CAPTURE_STALL_SECS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(stall_secs);
+    // done-flag is checked first, so the normal case (EOF arrives with the child's
+    // exit) returns immediately; the short tick only adds latency when EOF briefly
+    // lags the child, and is the polling granularity for detecting a real stall.
+    let stalled = loop {
+        if out_done.load(Ordering::SeqCst) && err_done.load(Ordering::SeqCst) {
+            break false;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     };
 
-    let (status, stdout, stderr) = futures::future::try_join3(status, stdout, stderr).await?;
+    if stalled {
+        // Emit forensics to a comms-loss-surviving channel, then stop reading.
+        diagnose_capture_stall(
+            child_pid,
+            stall_secs,
+            &[
+                ("stdout", out_fd, out_done.load(Ordering::SeqCst)),
+                ("stderr", err_fd, err_done.load(Ordering::SeqCst)),
+            ],
+        );
+        // Abort the stuck task(s); dropping the reader closes our read-end (which
+        // also gives any late writer an EPIPE instead of a silent hang).
+        if let Some(t) = &out_task {
+            t.abort();
+        }
+        if let Some(t) = &err_task {
+            t.abort();
+        }
+    }
+
+    let stdout = std::mem::take(&mut *out_buf.lock().unwrap());
+    let stderr = std::mem::take(&mut *err_buf.lock().unwrap());
 
     Ok(process::Output {
         status,
-        stdout: stdout.unwrap_or_default(),
-        stderr: stderr.unwrap_or_default(),
+        stdout,
+        stderr,
     })
+}
+
+/// Emit a forensic diagnostic when stdout/stderr capture is still open long
+/// after the direct child exited -- i.e. a lingering grandchild is holding the
+/// pipe write-end open (mozilla/sccache#1011 variant #2).
+///
+/// Written to this process' stderr (and to `SCCACHE_ERROR_LOG` if set) so it
+/// survives a runner comms-loss: the daemonized server's stderr is the
+/// `SCCACHE_ERROR_LOG` file when that is configured, and when the server runs in
+/// the foreground with stderr wired to the build step (e.g. `SCCACHE_NO_DAEMON=1`)
+/// the line lands in GitHub's streamed step log, which is retained even if the
+/// runner dies mid-build. Uses only `/proc`, which exists on the Linux CI hosts;
+/// on other platforms it degrades to the header lines.
+fn diagnose_capture_stall(
+    child_pid: Option<u32>,
+    stall_secs: u64,
+    streams: &[(&str, Option<i32>, bool)],
+) {
+    use std::io::Write as _;
+
+    let mut out = String::new();
+    out.push_str("\n===== sccache CAPTURE STALL WATCHDOG =====\n");
+    out.push_str(&format!(
+        "capture still open {}s after direct child exit (SCCACHE_CAPTURE_STALL_SECS={})\n\
+         direct child pid: {:?}   watchdog pid: {}\n",
+        stall_secs,
+        stall_secs,
+        child_pid,
+        std::process::id()
+    ));
+
+    for (name, fd, eof) in streams {
+        if *eof {
+            out.push_str(&format!("stream {}: closed (EOF seen)\n", name));
+            continue;
+        }
+        out.push_str(&format!(
+            "stream {}: NOT closed -- our read fd = {:?}\n",
+            name, fd
+        ));
+        let pipe = fd
+            .and_then(|fd| std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok())
+            .map(|p| p.to_string_lossy().into_owned());
+        match &pipe {
+            Some(pipe) => {
+                out.push_str(&format!("  our fd -> {}\n", pipe));
+                out.push_str(&format!("  other processes still holding {}:\n", pipe));
+                let mut found = false;
+                let me = std::process::id();
+                if let Ok(entries) = std::fs::read_dir("/proc") {
+                    for entry in entries.flatten() {
+                        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok())
+                        {
+                            Some(p) if p != me => p,
+                            _ => continue,
+                        };
+                        let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else {
+                            continue;
+                        };
+                        for f in fds.flatten() {
+                            let Ok(target) = std::fs::read_link(f.path()) else {
+                                continue;
+                            };
+                            if target.to_string_lossy() == *pipe {
+                                found = true;
+                                let comm = read_proc(pid, "comm");
+                                let wchan = read_proc(pid, "wchan");
+                                let stack = std::fs::read_to_string(format!("/proc/{}/stack", pid))
+                                    .unwrap_or_else(|_| "<unavailable (needs CAP_SYS_ADMIN)>".into());
+                                let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid))
+                                    .map(|b| {
+                                        String::from_utf8_lossy(&b)
+                                            .replace('\0', " ")
+                                            .trim()
+                                            .to_string()
+                                    })
+                                    .unwrap_or_default();
+                                out.push_str(&format!(
+                                    "    pid {pid} fd {} comm='{}' wchan='{}' cmd='{}'\n\
+                                     \x20     stack: {}\n",
+                                    f.file_name().to_string_lossy(),
+                                    comm.trim(),
+                                    wchan.trim(),
+                                    cmdline,
+                                    stack.trim().replace('\n', " | "),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    out.push_str("    (none found in /proc -- non-Linux host or already reaped)\n");
+                }
+            }
+            None => out.push_str("  (could not resolve our fd via /proc)\n"),
+        }
+    }
+    out.push_str("===== end sccache CAPTURE STALL WATCHDOG =====\n");
+
+    // 1) Process stderr: the daemon's stderr is SCCACHE_ERROR_LOG when set, or the
+    //    build step's streamed log under a foreground server -- both retained.
+    let _ = std::io::stderr().write_all(out.as_bytes());
+    let _ = std::io::stderr().flush();
+    // 2) Also append directly to SCCACHE_ERROR_LOG in case stderr is elsewhere.
+    if let Ok(path) = std::env::var("SCCACHE_ERROR_LOG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(out.as_bytes());
+        }
+    }
+    // 3) And through the log facility for SCCACHE_LOG consumers.
+    error!("sccache capture stall: see CAPTURE STALL WATCHDOG dump on stderr");
+}
+
+/// Best-effort read of a small `/proc/<pid>/<name>` file, trimmed.
+fn read_proc(pid: u32, name: &str) -> String {
+    std::fs::read_to_string(format!("/proc/{}/{}", pid, name)).unwrap_or_default()
 }
 
 /// Run `command`, writing `input` to its stdin if it is `Some` and return the exit status and output.

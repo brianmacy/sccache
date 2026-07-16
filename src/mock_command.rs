@@ -74,6 +74,18 @@ pub trait CommandChild {
     fn take_stdout(&mut self) -> Option<Self::O>;
     /// Take the stderr object from the process, if available.
     fn take_stderr(&mut self) -> Option<Self::E>;
+    /// The child's process id, if still available (i.e. before `wait` reaps it).
+    /// Used only for hang diagnostics; defaults to `None`.
+    fn id(&self) -> Option<u32> {
+        None
+    }
+    /// Best-effort raw fds of the *read* ends (this process' side) of the
+    /// captured stdout/stderr pipes, as `(stdout_fd, stderr_fd)`. Used only for
+    /// the capture-stall watchdog to locate lingering pipe holders in `/proc`.
+    /// Must be called before `take_stdout`/`take_stderr`. Defaults to `None`s.
+    fn capture_fds(&self) -> (Option<i32>, Option<i32>) {
+        (None, None)
+    }
     /// Wait for the process to complete and return its exit status.
     async fn wait(self) -> io::Result<ExitStatus>;
     /// Wait for the process to complete and return its output.
@@ -160,6 +172,19 @@ impl CommandChild for Child {
     }
     fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.inner.stderr.take()
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.inner.id()
+    }
+
+    #[cfg(unix)]
+    fn capture_fds(&self) -> (Option<i32>, Option<i32>) {
+        use std::os::unix::io::AsRawFd;
+        (
+            self.inner.stdout.as_ref().map(|s| s.as_raw_fd()),
+            self.inner.stderr.as_ref().map(|s| s.as_raw_fd()),
+        )
     }
 
     async fn wait(self) -> io::Result<ExitStatus> {
