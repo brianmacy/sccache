@@ -665,7 +665,9 @@ fn diagnose_capture_stall(
                                 let comm = read_proc(pid, "comm");
                                 let wchan = read_proc(pid, "wchan");
                                 let stack = std::fs::read_to_string(format!("/proc/{}/stack", pid))
-                                    .unwrap_or_else(|_| "<unavailable (needs CAP_SYS_ADMIN)>".into());
+                                    .unwrap_or_else(|_| {
+                                        "<unavailable (needs CAP_SYS_ADMIN)>".into()
+                                    });
                                 let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid))
                                     .map(|b| {
                                         String::from_utf8_lossy(&b)
@@ -702,7 +704,11 @@ fn diagnose_capture_stall(
     let _ = std::io::stderr().flush();
     // 2) Also append directly to SCCACHE_ERROR_LOG in case stderr is elsewhere.
     if let Ok(path) = std::env::var("SCCACHE_ERROR_LOG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = f.write_all(out.as_bytes());
         }
     }
