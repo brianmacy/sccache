@@ -60,7 +60,7 @@ jobs:
         with:
           files: target/integration-coverage/reports/lcov.info
           name: codecov-umbrella-integration-${{ matrix.type }}
-          fail_ci_if_error: true
+          fail_ci_if_error: false
           # verbose: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
